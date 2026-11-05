@@ -36,6 +36,28 @@ HERRAMIENTAS = [
     {
         "type": "function",
         "function": {
+            "name": "resumir_documento",
+            "description": (
+                "Genera un resumen breve de un documento concreto. "
+                "Utiliza esta herramienta cuando el usuario solicite "
+                "resumir un documento identificado por su nombre."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nombre_documento": {
+                        "type": "string",
+                        "description": "Nombre exacto del documento que se quiere resumir."
+                    }
+                },
+                "required": ["nombre_documento"],
+                "additionalProperties": False
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "listar_documentos",
             "description": (
                 "Lista los documentos que están indexados en las colecciones "
@@ -66,6 +88,12 @@ def ejecutar_herramienta(nombre, argumentos):
 
         return listar_documentos()
 
+    elif nombre == "resumir_documento":
+
+        nombre_documento = argumentos["nombre_documento"]
+
+        return resumir_documento(nombre_documento)
+
     return f"Herramienta desconocida: {nombre}"
 
 
@@ -78,24 +106,26 @@ def ejecutar_agente(pregunta, max_iteraciones=5):
             {
                 "role": "system",
                 "content": (
-                    "Eres un agente especializado en consultar documentación.\n"
-                    "Tienes acceso a dos herramientas:\n"
-                    "- consultar_documentos: consulta el contenido de los documentos.\n"
-                    "- listar_documentos: muestra los documentos indexados.\n\n"
-                
-                    "REGLAS DE COMPORTAMIENTO:\n"
-                    "1. Si el usuario pregunta sobre currículums o documentación "
-                    "científica, utiliza consultar_documentos.\n"
-                    "2. Si pregunta qué documentos hay disponibles, utiliza "
-                    "listar_documentos.\n"
-                    "3. No respondas preguntas documentales utilizando tus "
-                    "conocimientos generales.\n"
-                    "4. Espera el resultado de la herramienta antes de responder.\n"
-                    "5. Basa tus respuestas en los resultados obtenidos.\n"
-                    "6. Si la documentación no contiene información suficiente, "
-                    "indícalo claramente.\n"
-                    )
-
+            "Eres un agente especializado en consultar documentación.\n"
+            "Tienes acceso a tres herramientas:\n"
+            "- consultar_documentos: consulta el contenido de los documentos.\n"
+            "- listar_documentos: muestra los documentos indexados.\n"
+            "- resumir_documento: genera un resumen de un documento concreto.\n\n"
+        
+            "REGLAS DE COMPORTAMIENTO:\n"
+            "1. Si el usuario pregunta sobre currículums o documentación "
+            "científica, utiliza consultar_documentos.\n"
+            "2. Si pregunta qué documentos hay disponibles, utiliza "
+            "listar_documentos.\n"
+            "3. Si solicita un resumen de un documento concreto, utiliza "
+            "resumir_documento.\n"
+            "4. No respondas preguntas documentales utilizando tus "
+            "conocimientos generales.\n"
+            "5. Espera el resultado de la herramienta antes de responder.\n"
+            "6. Basa tus respuestas en los resultados obtenidos.\n"
+            "7. Si la documentación no contiene información suficiente, "
+            "indícalo claramente.\n"
+            )
             },
             {
                 "role": "user",
@@ -188,6 +218,164 @@ def listar_documentos():
     except Exception as e:
         return f"Error al listar documentos: {e}"
 
+def resumir_documento(nombre_documento):
+    """
+    Recupera todos los fragmentos de un documento
+    y genera un resumen breve con Groq.
+    """
+
+    try:
+        cliente_chroma = obtener_cliente_chroma()
+
+        coincidencias = []
+
+        # Buscar el documento en todas las colecciones.
+        for tipo, nombre_coleccion in COLECCIONES.items():
+
+            coleccion = cliente_chroma.get_collection(
+                name=nombre_coleccion
+            )
+
+            datos = coleccion.get(
+                where={"documento_origen": nombre_documento},
+                include=["documents", "metadatas"]
+            )
+
+            if datos["documents"]:
+                coincidencias.append({
+                    "tipo": tipo,
+                    "documentos": datos["documents"],
+                    "metadatos": datos["metadatas"]
+                })
+
+        if not coincidencias:
+            return (
+                f"No se ha encontrado el documento "
+                f"'{nombre_documento}'."
+            )
+
+        if len(coincidencias) > 1:
+            tipos = ", ".join(
+                coincidencia["tipo"]
+                for coincidencia in coincidencias
+            )
+            return (
+                f"El documento aparece en varias colecciones: {tipos}. "
+                "Necesitamos identificar cuál se quiere resumir."
+            )
+
+        coincidencia = coincidencias[0]
+
+        # Ordenar los fragmentos por su número original.
+        fragmentos = sorted(
+            zip(
+                coincidencia["metadatos"],
+                coincidencia["documentos"]
+            ),
+            key=lambda elemento: int(
+                elemento[0].get("numero_chunk", 0)
+            )
+        )
+
+        textos = [
+            texto for _, texto in fragmentos
+            if texto and texto.strip()
+        ]
+
+        if not textos:
+            return "El documento no contiene texto para resumir."
+
+        print(
+            f"Documento: {nombre_documento} | "
+            f"Fragmentos: {len(textos)}"
+        )
+
+        _, cliente_groq = rag.crear_clientes()
+
+        # Dividir el contenido en bloques para controlar
+        # el tamaño de cada petición a Groq.
+        bloques = []
+        bloque_actual = ""
+
+        for texto in textos:
+
+            if bloque_actual and len(bloque_actual) + len(texto) > 12000:
+                bloques.append(bloque_actual)
+                bloque_actual = ""
+
+            bloque_actual += texto + "\n\n"
+
+        if bloque_actual:
+            bloques.append(bloque_actual)
+
+        resumenes = []
+
+        # Resumir cada bloque.
+        for numero, bloque in enumerate(bloques, start=1):
+
+            respuesta = cliente_groq.chat.completions.create(
+                model=rag.MODELO_IA,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Resume el contenido documental de forma "
+                            "breve y objetiva. Utiliza exclusivamente "
+                            "la información proporcionada. "
+                            "No inventes ni añadas datos."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Documento: {nombre_documento}\n"
+                            f"Parte {numero} de {len(bloques)}:\n\n"
+                            f"{bloque}"
+                        )
+                    }
+                ],
+                temperature=0.2,
+                max_tokens=500
+            )
+
+            resumen = respuesta.choices[0].message.content
+
+            if not resumen:
+                return "Groq no ha generado el resumen."
+
+            resumenes.append(resumen)
+
+        # Si hay varios bloques, unificar sus resúmenes.
+        if len(resumenes) == 1:
+            return resumenes[0]
+
+        respuesta_final = cliente_groq.chat.completions.create(
+            model=rag.MODELO_IA,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Elabora un resumen breve y unificado "
+                        "a partir de los resúmenes parciales. "
+                        "Evita repeticiones y no añadas información."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": "\n\n".join(resumenes)
+                }
+            ],
+            temperature=0.2,
+            max_tokens=700
+        )
+
+        return (
+            respuesta_final.choices[0].message.content
+            or "No se ha podido generar el resumen final."
+        )
+
+    except Exception as e:
+        return f"Error al resumir el documento: {e}"
 
 def buscar_documentos(pregunta, tipo_documento):
     """
@@ -427,3 +615,4 @@ if __name__ == "__main__":
     print("RESPUESTA FINAL DEL AGENTE")
     print("=" * 60)
     print(respuesta)
+    
