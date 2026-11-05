@@ -10,6 +10,7 @@ COLECCIONES = {
 }
 
 
+
 HERRAMIENTAS = [
     {
         "type": "function",
@@ -31,8 +32,27 @@ HERRAMIENTAS = [
                 "additionalProperties": False
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "listar_documentos",
+            "description": (
+                "Lista los documentos que están indexados en las colecciones "
+                "de ciencia y currículums. Utiliza esta herramienta cuando "
+                "el usuario pregunte qué documentos hay disponibles, "
+                "cuáles están indexados o solicite un listado."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False
+            }
+        }
     }
 ]
+
 
 def ejecutar_herramienta(nombre, argumentos):
 
@@ -42,7 +62,12 @@ def ejecutar_herramienta(nombre, argumentos):
 
         return consultar_automaticamente(pregunta)
 
+    elif nombre == "listar_documentos":
+
+        return listar_documentos()
+
     return f"Herramienta desconocida: {nombre}"
+
 
 def ejecutar_agente(pregunta, max_iteraciones=5):
 
@@ -53,20 +78,24 @@ def ejecutar_agente(pregunta, max_iteraciones=5):
             {
                 "role": "system",
                 "content": (
-                "Eres un agente especializado en consultar documentación. "
-                "Tienes acceso a la herramienta consultar_documentos. "
-                "\n\n"
-                "REGLAS DE COMPORTAMIENTO:\n"
-                "1. Si el usuario pregunta sobre currículums o documentación "
-                "científica, debes utilizar consultar_documentos antes de responder.\n"
-                "2. No respondas estas preguntas utilizando tus conocimientos "
-                "generales.\n"
-                "3. Espera el resultado de la herramienta antes de elaborar "
-                "tu respuesta.\n"
-                "4. Basa tu respuesta exclusivamente en el resultado obtenido.\n"
-                "5. Si la documentación no contiene información suficiente, "
-                "indícalo claramente.\n"
-                )
+                    "Eres un agente especializado en consultar documentación.\n"
+                    "Tienes acceso a dos herramientas:\n"
+                    "- consultar_documentos: consulta el contenido de los documentos.\n"
+                    "- listar_documentos: muestra los documentos indexados.\n\n"
+                
+                    "REGLAS DE COMPORTAMIENTO:\n"
+                    "1. Si el usuario pregunta sobre currículums o documentación "
+                    "científica, utiliza consultar_documentos.\n"
+                    "2. Si pregunta qué documentos hay disponibles, utiliza "
+                    "listar_documentos.\n"
+                    "3. No respondas preguntas documentales utilizando tus "
+                    "conocimientos generales.\n"
+                    "4. Espera el resultado de la herramienta antes de responder.\n"
+                    "5. Basa tus respuestas en los resultados obtenidos.\n"
+                    "6. Si la documentación no contiene información suficiente, "
+                    "indícalo claramente.\n"
+                    )
+
             },
             {
                 "role": "user",
@@ -119,22 +148,46 @@ def ejecutar_agente(pregunta, max_iteraciones=5):
     except Exception as e:
         return f"Error en el agente: {e}"
 
+
 def listar_documentos():
     """
-    Devuelve los nombres de los documentos indexados.
+    Lista los documentos indexados en todas las colecciones.
     """
+
     try:
-        coleccion = rag.obtener_coleccion()
+        cliente_chroma = obtener_cliente_chroma()
 
-        documentos = rag.obtener_documentos_indexados(coleccion)
+        respuesta = []
 
-        if not documentos:
-            return "No hay documentos indexados."
+        for tipo, nombre_coleccion in COLECCIONES.items():
 
-        return "\n".join(documentos)
+            coleccion = cliente_chroma.get_collection(
+                name=nombre_coleccion
+            )
+
+            datos = coleccion.get(
+                include=["metadatas"]
+            )
+
+            documentos = set()
+
+            for metadata in datos["metadatas"]:
+                nombre = metadata.get("documento_origen")
+
+                if isinstance(nombre, str) and nombre.strip():
+                    documentos.add(nombre.strip())
+
+            respuesta.append(f"\nCOLECCIÓN: {tipo.upper()}")
+            respuesta.append(f"Documentos: {len(documentos)}")
+
+            for documento in sorted(documentos):
+                respuesta.append(f"- {documento}")
+
+        return "\n".join(respuesta)
 
     except Exception as e:
         return f"Error al listar documentos: {e}"
+
 
 def buscar_documentos(pregunta, tipo_documento):
     """
@@ -366,7 +419,7 @@ def consultar_automaticamente(pregunta):
     return respuesta
 
 if __name__ == "__main__":
-    pregunta = "Busca currículums con experiencia en SQL Server"
+    pregunta = input("\nTú: ")
 
     respuesta = ejecutar_agente(pregunta)
 
