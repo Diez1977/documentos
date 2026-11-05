@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -73,10 +74,15 @@ NOMBRE_COLECCION = "documentos_rag"
 
 TAMANO_CHUNK = 1000
 SOLAPAMIENTO = 200
-RESULTADOS_RECUPERACION = 5
+RESULTADOS_RECUPERACION = 20
+FRAGMENTOS_CONTEXTO = 5
+MAX_FRAGMENTOS_POR_DOCUMENTO = 2
+DISTANCIA_MAXIMA = 0.38
 MAX_CARACTERES_CONTEXTO = 18000
 PAUSA_ENTRE_EMBEDDINGS = 1.0
 MAX_REINTENTOS = 3
+MAX_CARACTERES_BLOQUE = 12000
+MAX_CARACTERES_RESUMENES = 16000
 
 EXTENSIONES_ADMITIDAS = {".pdf", ".docx"}
 
@@ -214,7 +220,60 @@ def dividir_en_fragmentos(
 
     return fragmentos
 
+def agrupar_fragmentos(
+    fragmentos: list[dict[str, Any]],
+    max_caracteres: int = MAX_CARACTERES_BLOQUE
+) -> list[list[dict[str, Any]]]:
 
+    bloques = []
+    bloque_actual = []
+    caracteres = 0
+
+    for fragmento in fragmentos:
+
+        cabecera = (
+            f"[Fuente: {fragmento['documento']} | "
+            f"Fragmento: {fragmento['numero_chunk']}]\n"
+        )
+
+        longitud = len(cabecera) + len(fragmento["texto"]) + 2
+
+        # Si un fragmento supera el límite, lo dividimos
+        # conservando su número de referencia.
+        if longitud > max_caracteres:
+
+            if bloque_actual:
+                bloques.append(bloque_actual)
+                bloque_actual = []
+                caracteres = 0
+
+            texto = fragmento["texto"]
+            tamano = max_caracteres - len(cabecera) - 2
+
+            for inicio in range(0, len(texto), tamano):
+
+                parte = texto[inicio:inicio + tamano]
+
+                bloques.append([{
+                    **fragmento,
+                    "texto": parte
+                }])
+
+            continue
+
+        if caracteres + longitud > max_caracteres:
+
+            bloques.append(bloque_actual)
+            bloque_actual = []
+            caracteres = 0
+
+        bloque_actual.append(fragmento)
+        caracteres += longitud
+
+    if bloque_actual:
+        bloques.append(bloque_actual)
+
+    return bloques
 # ============================================================
 # EMBEDDINGS
 # ============================================================
@@ -268,11 +327,13 @@ def crear_id_fragmento(nombre_documento: str, numero: int, texto: str) -> str:
     return hashlib.sha256(contenido.encode("utf-8")).hexdigest()
 
 
+
 def indexar_documento(
     ruta: Path,
     cliente_gemini: genai.Client,
     coleccion: Any
 ) -> int:
+
     nombre = ruta.name
     print(f"\nProcesando: {nombre}")
 
@@ -283,20 +344,14 @@ def indexar_documento(
         print("  El documento no contiene texto extraíble. Se omite.")
         return 0
 
-    # Eliminamos únicamente los fragmentos anteriores de este documento
-    # dentro de la colección nueva de RAG.
-    try:
-        coleccion.delete(where={"documento_origen": nombre})
-    except Exception:
-        # Si todavía no existen fragmentos para este documento, continuamos.
-        pass
-
     ids = []
     documentos = []
     metadatos = []
     embeddings = []
 
+    # 1. Generamos todos los embeddings antes de modificar ChromaDB.
     for numero, fragmento in enumerate(fragmentos, start=1):
+
         print(
             f"  Generando embedding {numero}/{len(fragmentos)}...",
             end="\r",
@@ -307,27 +362,49 @@ def indexar_documento(
 
         ids.append(crear_id_fragmento(nombre, numero, fragmento))
         documentos.append(fragmento)
+
         metadatos.append({
             "documento_origen": nombre,
             "numero_chunk": numero
         })
+
         embeddings.append(vector)
 
         if numero < len(fragmentos):
             time.sleep(PAUSA_ENTRE_EMBEDDINGS)
 
-    coleccion.add(
+    # 2. Recuperamos los identificadores anteriores.
+    resultado_anterior = coleccion.get(
+        where={"documento_origen": nombre}
+    )
+
+    ids_antiguos = resultado_anterior["ids"]
+
+    # 3. Insertamos o actualizamos los fragmentos nuevos.
+    coleccion.upsert(
         ids=ids,
         documents=documentos,
         metadatas=metadatos,
         embeddings=embeddings
     )
 
+    # 4. Eliminamos los fragmentos antiguos que sobren.
+    ids_obsoletos = [
+        id_antiguo
+        for id_antiguo in ids_antiguos
+        if id_antiguo not in ids
+    ]
+
+    if ids_obsoletos:
+        coleccion.delete(ids=ids_obsoletos)
+
     print(
         f"  Indexación completada: {len(fragmentos)} fragmentos."
         + " " * 20
     )
+
     return len(fragmentos)
+
 
 
 def indexar_documentos(
@@ -375,12 +452,14 @@ def indexar_documentos(
 # RECUPERACIÓN DE CONTEXTO
 # ============================================================
 
+
 def recuperar_fragmentos(
     pregunta: str,
     cliente_gemini: genai.Client,
     coleccion: Any,
     cantidad: int = RESULTADOS_RECUPERACION
 ) -> list[dict[str, Any]]:
+
     if coleccion.count() == 0:
         return []
 
@@ -397,20 +476,47 @@ def recuperar_fragmentos(
     distancias = resultados.get("distances", [[]])[0]
 
     fragmentos = []
+    contador_documentos = {}
 
     for texto, metadata, distancia in zip(
         documentos,
         metadatos,
         distancias
     ):
+        distancia = float(distancia)
+        print(
+            f"Documento: {metadata.get('documento_origen')} | "
+            f"Fragmento: {metadata.get('numero_chunk')} | "
+            f"Distancia: {distancia:.4f}"
+        )
+
+        if distancia > DISTANCIA_MAXIMA:
+            continue
+
+        nombre_documento = metadata.get(
+            "documento_origen",
+            "Desconocido"
+        )
+
+        cantidad_documento = contador_documentos.get(
+            nombre_documento,
+            0
+        )
+
+        if cantidad_documento >= MAX_FRAGMENTOS_POR_DOCUMENTO:
+            continue
+
         fragmentos.append({
             "texto": texto,
-            "documento": metadata.get("documento_origen", "Desconocido"),
+            "documento": nombre_documento,
             "numero_chunk": metadata.get("numero_chunk", "?"),
-            "distancia": float(distancia)
+            "distancia": distancia
         })
 
+        contador_documentos[nombre_documento] = cantidad_documento + 1
+
     return fragmentos
+
 
 
 def construir_contexto(
@@ -420,7 +526,7 @@ def construir_contexto(
     partes = []
     caracteres = 0
 
-    for fragmento in fragmentos:
+    for fragmento in fragmentos[:FRAGMENTOS_CONTEXTO]:
         cabecera = (
             f"[Fuente: {fragmento['documento']} | "
             f"Fragmento: {fragmento['numero_chunk']}]\n"
@@ -439,6 +545,377 @@ def construir_contexto(
 
     return "\n".join(partes)
 
+def construir_contexto_documento(
+    fragmentos: list[dict[str, Any]],
+    max_caracteres: int = MAX_CARACTERES_CONTEXTO
+) -> str:
+
+    partes = []
+    caracteres = 0
+
+    for fragmento in fragmentos:
+
+        cabecera = (
+            f"[Fuente: {fragmento['documento']} | "
+            f"Fragmento: {fragmento['numero_chunk']}]\n"
+        )
+
+        bloque = cabecera + fragmento["texto"] + "\n\n"
+
+        espacio_restante = max_caracteres - caracteres
+
+        if espacio_restante <= 0:
+            break
+
+        if len(bloque) > espacio_restante:
+            bloque = bloque[:espacio_restante]
+
+        partes.append(bloque)
+        caracteres += len(bloque)
+
+    return "\n".join(partes)
+
+def obtener_documentos_indexados(coleccion: Any) -> list[str]:
+
+    resultado = coleccion.get(include=["metadatas"])
+
+    documentos = {
+        metadata["documento_origen"]
+        for metadata in resultado["metadatas"]
+        if metadata and "documento_origen" in metadata
+    }
+
+    return sorted(documentos)
+
+def seleccionar_documento(coleccion: Any) -> str | None:
+
+    documentos = obtener_documentos_indexados(coleccion)
+
+    if not documentos:
+        print("No hay documentos indexados.")
+        return None
+
+    print("\nDOCUMENTOS DISPONIBLES")
+    print("=" * 60)
+
+    for numero, documento in enumerate(documentos, start=1):
+        print(f"{numero}. {documento}")
+
+    try:
+        opcion = int(input("\nSelecciona un documento: "))
+
+        if 1 <= opcion <= len(documentos):
+            return documentos[opcion - 1]
+
+        print("Opción no válida.")
+        return None
+
+    except ValueError:
+        print("Debes introducir un número.")
+        return None
+
+
+def seleccionar_dos_documentos(
+    coleccion: Any
+) -> tuple[str, str] | None:
+
+    documentos = obtener_documentos_indexados(coleccion)
+
+    if len(documentos) < 2:
+        print("Se necesitan al menos dos documentos indexados.")
+        return None
+
+    print("\nDOCUMENTOS DISPONIBLES")
+    print("=" * 60)
+
+    for numero, documento in enumerate(documentos, start=1):
+        print(f"{numero}. {documento}")
+
+    try:
+        opcion1 = int(input("\nSelecciona el primer documento: "))
+
+        if not 1 <= opcion1 <= len(documentos):
+            print("Primera opción no válida.")
+            return None
+
+        opcion2 = int(input("Selecciona el segundo documento: "))
+
+        if not 1 <= opcion2 <= len(documentos):
+            print("Segunda opción no válida.")
+            return None
+
+        if opcion1 == opcion2:
+            print("Debes seleccionar dos documentos diferentes.")
+            return None
+
+        return documentos[opcion1 - 1], documentos[opcion2 - 1]
+
+    except ValueError:
+        print("Debes introducir números.")
+        return None
+
+
+
+def comparar_documentos(
+    cliente_groq: Groq,
+    coleccion: Any
+) -> None:
+
+    seleccion = seleccionar_dos_documentos(coleccion)
+
+    if seleccion is None:
+        return
+
+    documento1, documento2 = seleccion
+
+    fragmentos1 = recuperar_documento_completo(
+        coleccion,
+        documento1
+    )
+
+    fragmentos2 = recuperar_documento_completo(
+        coleccion,
+        documento2
+    )
+
+    if not fragmentos1 or not fragmentos2:
+        print("No se ha podido recuperar el contenido de ambos documentos.")
+        return
+
+    try:
+
+        print("\n" + "=" * 60)
+        print("COMPARACIÓN DE DOCUMENTOS")
+        print("=" * 60)
+
+        print(f"\nDocumento 1: {documento1}")
+        print(f"Documento 2: {documento2}")
+
+        print("\nGenerando síntesis del primer documento...")
+        sintesis1 = generar_sintesis_documento(
+            cliente_groq,
+            fragmentos1
+        )
+
+        print("\nGenerando síntesis del segundo documento...")
+        sintesis2 = generar_sintesis_documento(
+            cliente_groq,
+            fragmentos2
+        )
+
+        print("\nComparando documentos...\n")
+
+        instrucciones = (
+            "Eres un asistente especializado en comparar documentos. "
+            "Analiza exclusivamente las dos síntesis proporcionadas. "
+            "No inventes información ni extraigas conclusiones que "
+            "no estén respaldadas por ellas. "
+            "Organiza el resultado en estas cuatro secciones:\n"
+            "1. COINCIDENCIAS: temas, conceptos o información común.\n"
+            "2. DIFERENCIAS: contenidos o enfoques diferentes.\n"
+            "3. INFORMACIÓN EXCLUSIVA: aspectos relevantes que aparecen "
+            "en un documento y no en el otro. Identifica cuál.\n"
+            "4. CONCLUSIÓN: valoración breve de la relación entre ambos.\n\n"
+            "Incluye referencias documentales exactas para respaldar "
+            "las afirmaciones, utilizando exclusivamente este formato:\n"
+            "[Fuente: nombre_documento | Fragmento: numero].\n"
+            "No inventes ni modifiques referencias. "
+            "Si no hay información suficiente para establecer una "
+            "coincidencia o diferencia, indícalo."
+        )
+
+        contenido = (
+            f"DOCUMENTO 1: {documento1}\n\n"
+            f"{sintesis1}\n\n"
+            f"DOCUMENTO 2: {documento2}\n\n"
+            f"{sintesis2}"
+        )
+
+        resultado = generar_resumen_groq(
+            cliente_groq,
+            instrucciones,
+            contenido
+        )
+
+        print("\n" + "=" * 60)
+        print("RESULTADO DE LA COMPARACIÓN")
+        print("=" * 60)
+        print(resultado)
+
+        validar_referencias(
+            resultado,
+            fragmentos1 + fragmentos2
+        )
+
+    except Exception as e:
+        print(f"Error al comparar los documentos: {e}")
+
+def generar_sintesis_documento(
+    cliente_groq: Groq,
+    fragmentos: list[dict[str, Any]]
+) -> str:
+
+    bloques = agrupar_fragmentos(fragmentos)
+    resumenes = []
+
+    instrucciones = (
+        "Resume exclusivamente la información proporcionada. "
+        "Identifica las ideas principales y los conceptos importantes. "
+        "No inventes información. "
+        "Sé conciso y utiliza como máximo 600 palabras. "
+        "Prioriza los datos más relevantes y evita explicaciones secundarias. "
+        "Conserva las referencias documentales exactas con este formato: "
+        "[Fuente: nombre_documento | Fragmento: numero]. "
+        "No inventes ni modifiques referencias."
+    )
+    # Generar una síntesis por bloque.
+    for numero, bloque in enumerate(bloques, start=1):
+
+        print(f"  Procesando bloque {numero} de {len(bloques)}...")
+
+        contexto = construir_contexto_documento(
+            bloque,
+            max_caracteres=MAX_CARACTERES_BLOQUE
+        )
+
+        resumen = generar_resumen_groq(
+            cliente_groq,
+            instrucciones,
+            contexto
+        )
+
+        resumenes.append(resumen)
+
+    # Reducir las síntesis si superan el límite establecido.
+    limite = MAX_CARACTERES_RESUMENES // 2
+
+    while sum(len(r) for r in resumenes) > limite:
+
+        grupos = []
+        grupo_actual = []
+        caracteres = 0
+
+        for resumen in resumenes:
+
+            longitud = len(resumen) + 2
+
+            if grupo_actual and caracteres + longitud > limite:
+                grupos.append(grupo_actual)
+                grupo_actual = []
+                caracteres = 0
+
+            grupo_actual.append(resumen)
+            caracteres += longitud
+
+        if grupo_actual:
+            grupos.append(grupo_actual)
+
+        nuevas_sintesis = []
+
+        for grupo in grupos:
+
+            contenido = "\n\n".join(grupo)
+
+            sintesis = generar_resumen_groq(
+                cliente_groq,
+                (
+                    "Consolida los resúmenes proporcionados. "
+                    "Elimina repeticiones y conserva la información relevante. "
+                    "Mantén exactamente todas las referencias documentales "
+                    "que respalden la información. "
+                    "No inventes datos ni referencias."
+                ),
+                contenido
+            )
+
+            nuevas_sintesis.append(sintesis)
+
+        resumenes = nuevas_sintesis
+
+    return "\n\n".join(resumenes)
+
+
+def recuperar_documento_completo(
+    coleccion: Any,
+    nombre_documento: str
+) -> list[dict[str, Any]]:
+
+    resultado = coleccion.get(
+        where={"documento_origen": nombre_documento},
+        include=["documents", "metadatas"]
+    )
+
+    fragmentos = []
+
+    for texto, metadata in zip(
+        resultado["documents"],
+        resultado["metadatas"]
+    ):
+        fragmentos.append({
+            "texto": texto,
+            "documento": nombre_documento,
+            "numero_chunk": metadata["numero_chunk"]
+        })
+
+    fragmentos.sort(
+        key=lambda fragmento: fragmento["numero_chunk"]
+    )
+
+    return fragmentos
+def listar_documentos_con_resumen(
+    cliente_groq: Groq,
+    coleccion: Any
+) -> None:
+
+    documentos = obtener_documentos_indexados(coleccion)
+
+    if not documentos:
+        print("No hay documentos indexados.")
+        return
+
+    print("\nDOCUMENTOS Y DESCRIPCIONES")
+    print("=" * 60)
+
+    for numero, nombre in enumerate(documentos, start=1):
+
+        fragmentos = recuperar_documento_completo(
+            coleccion,
+            nombre
+        )
+
+        contexto = construir_contexto_documento(fragmentos)
+
+        try:
+            respuesta = cliente_groq.chat.completions.create(
+                model=MODELO_IA,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Describe el contenido del documento "
+                            "en un máximo de dos frases. "
+                            "Utiliza exclusivamente el contexto "
+                            "proporcionado. No inventes información."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": contexto
+                    }
+                ],
+                temperature=0.2
+            )
+
+            resumen = respuesta.choices[0].message.content
+
+            print(f"\n{numero}. {nombre}")
+            print(f"   {resumen or 'No se pudo generar la descripción.'}")
+
+        except Exception as e:
+            print(f"\n{numero}. {nombre}")
+            print(f"   Error al generar la descripción: {e}")
+
+    print("\n" + "=" * 60)
 
 # ============================================================
 # GENERACIÓN DE RESPUESTAS (RAG)
@@ -450,79 +927,470 @@ def responder_con_rag(
     cliente_groq: Groq,
     coleccion: Any
 ) -> None:
+
     print("\nBuscando información relevante...")
+
+    # 1. Recuperar fragmentos relevantes
     fragmentos = recuperar_fragmentos(
         pregunta,
         cliente_gemini,
         coleccion
     )
 
+    # 2. Comprobar si hay información disponible
     if not fragmentos:
-        print("La colección RAG está vacía. Indexa documentos primero.")
+
+        if coleccion.count() == 0:
+            print("La colección RAG está vacía. Indexa documentos primero.")
+
+        else:
+            print("No se ha encontrado información suficientemente relevante.")
+            print(f"Distancia máxima permitida: {DISTANCIA_MAXIMA}")
+            print("No se realizará ninguna consulta a Groq.")
+
         return
 
+    # 3. Construir el contexto documental
     contexto = construir_contexto(fragmentos)
 
-    print(f"Fragmentos recuperados: {len(fragmentos)}")
     print("Generando respuesta con IA...\n")
 
-    instrucciones = (
-        INSTRUCCIONES_SISTEMA
-        + "\n\n"
-        + "Responde utilizando exclusivamente la información del CONTEXTO. "
-        + "No inventes datos ni completes información ausente con suposiciones. "
-        + "Si el contexto no permite responder, indícalo claramente. "
-        + "Distingue los hechos explícitos de las inferencias. "
-        + "Cuando sea posible, identifica el documento del que procede cada dato."
-    )
+    # 4. Instrucciones del sistema
+    instrucciones = INSTRUCCIONES_SISTEMA
 
+    # 5. Construir el mensaje del usuario
     mensaje_usuario = (
-        "CONTEXTO DOCUMENTAL:\n"
-        f"{contexto}\n\n"
+        "A continuación tienes los fragmentos recuperados "
+        "de los documentos.\n\n"
+        "=== INICIO DEL CONTEXTO DOCUMENTAL ===\n"
+        f"{contexto}\n"
+        "=== FIN DEL CONTEXTO DOCUMENTAL ===\n\n"
         "PREGUNTA DEL USUARIO:\n"
         f"{pregunta}"
     )
 
+    # 6. Consultar a Groq
     try:
+
         respuesta = cliente_groq.chat.completions.create(
             model=MODELO_IA,
             messages=[
-                {"role": "system", "content": instrucciones},
-                {"role": "user", "content": mensaje_usuario}
+                {
+                    "role": "system",
+                    "content": instrucciones
+                },
+                {
+                    "role": "user",
+                    "content": mensaje_usuario
+                }
             ],
             temperature=0.2
         )
 
+        # 7. Mostrar respuesta
         contenido = respuesta.choices[0].message.content
 
         print("=" * 60)
         print("RESPUESTA")
         print("=" * 60)
-        print(contenido or "El modelo no ha devuelto texto.")
 
+        print(contenido)
+        # Validar referencias
+        validar_referencias(contenido, fragmentos)
+        # 8. Mostrar fuentes recuperadas
         print("\n" + "=" * 60)
         print("FUENTES RECUPERADAS")
         print("=" * 60)
 
-        fuentes_vistas = set()
-        for fragmento in fragmentos:
-            clave = (
-                fragmento["documento"],
-                fragmento["numero_chunk"]
-            )
-            if clave in fuentes_vistas:
-                continue
+        for numero, fragmento in enumerate(fragmentos, start=1):
 
-            fuentes_vistas.add(clave)
+            print(f"\nFuente {numero}")
+            print(f"Documento: {fragmento['documento']}")
+            print(f"Fragmento: {fragmento['numero_chunk']}")
+            print(f"Distancia: {fragmento['distancia']:.4f}")
+
+    except Exception as e:
+
+        print(f"Error al generar la respuesta con IA: {e}")
+
+
+
+
+def validar_referencias(
+    respuesta: str,
+    fragmentos: list[dict[str, Any]]
+) -> None:
+
+    referencias_validas = {
+        (f["documento"], str(f["numero_chunk"]))
+        for f in fragmentos
+    }
+
+    # Documentos disponibles para cada número de fragmento.
+    documentos_por_numero = {}
+
+    for documento, numero in referencias_validas:
+        documentos_por_numero.setdefault(numero, set()).add(documento)
+
+    # Admite referencias con Fuente opcional y distintos tipos de guion.
+    patron = (
+        r"\[(?:Fuente:\s*(.*?)\s*\|\s*)?"
+        r"Fragmentos?:\s*"
+        r"(\d+(?:\s*[-‐‑‒–—]\s*\d+)?"
+        r"(?:\s*,\s*\d+(?:\s*[-‐‑‒–—]\s*\d+)?)*)\s*\]"
+    )
+
+    coincidencias = re.findall(patron, respuesta)
+
+    referencias_citadas = set()
+    referencias_ambiguas = set()
+
+    for documento, numeros in coincidencias:
+
+        # Separar números individuales y rangos.
+        partes = re.split(r"\s*,\s*", numeros)
+
+        numeros_extraidos = set()
+
+        for parte in partes:
+
+            rango = re.fullmatch(
+                r"(\d+)\s*[-‐‑‒–—]\s*(\d+)",
+                parte
+            )
+
+            if rango:
+                inicio, fin = map(int, rango.groups())
+
+                if inicio > fin:
+                    inicio, fin = fin, inicio
+
+                numeros_extraidos.update(
+                    str(n) for n in range(inicio, fin + 1)
+                )
+
+            else:
+                numeros_extraidos.add(parte.strip())
+
+        for numero in numeros_extraidos:
+
+            if documento:
+                referencias_citadas.add(
+                    (documento.strip(), numero)
+                )
+
+            else:
+                # Sin documento, solo podemos validar si el número
+                # pertenece a un único documento.
+                documentos = documentos_por_numero.get(numero, set())
+
+                if len(documentos) == 1:
+                    referencias_citadas.add(
+                        (next(iter(documentos)), numero)
+                    )
+
+                elif len(documentos) > 1:
+                    referencias_ambiguas.add(numero)
+
+                else:
+                    referencias_citadas.add(
+                        ("Documento no identificado", numero)
+                    )
+
+    referencias_correctas = referencias_citadas & referencias_validas
+    referencias_incorrectas = referencias_citadas - referencias_validas
+
+    print("\n" + "=" * 60)
+    print("VALIDACIÓN DE REFERENCIAS")
+    print("=" * 60)
+
+    # Mostrar resultados separados por documento.
+    documentos = sorted({doc for doc, _ in referencias_validas})
+
+    for documento in documentos:
+
+        correctas = sorted(
+            numero for doc, numero in referencias_correctas
+            if doc == documento
+        )
+
+        incorrectas = sorted(
+            numero for doc, numero in referencias_incorrectas
+            if doc == documento
+        )
+
+        print(f"\nDOCUMENTO: {documento}")
+        print("-" * 60)
+        print(f"Referencias válidas: {len(correctas)}")
+        print(f"Referencias no válidas: {len(incorrectas)}")
+
+        if correctas:
+            print("Válidas: " + ", ".join(correctas))
+
+        if incorrectas:
+            print("No válidas: " + ", ".join(incorrectas))
+
+    if referencias_ambiguas:
+        print("\nREFERENCIAS AMBIGUAS")
+        print("-" * 60)
+
+        for numero in sorted(referencias_ambiguas, key=int):
             print(
-                f"- {fragmento['documento']} "
-                f"(fragmento {fragmento['numero_chunk']}, "
-                f"distancia {fragmento['distancia']:.4f})"
+                f"Fragmento {numero}: aparece en varios documentos "
+                "y no se puede identificar su origen."
             )
 
-    except Exception as error:
-        print(f"No se pudo generar la respuesta con Groq: {error}")
+    if not coincidencias:
+        print("\nAVISO: No se han encontrado referencias reconocibles.")
 
+    print("\n" + "-" * 60)
+    print(f"Total de referencias válidas: {len(referencias_correctas)}")
+    print(f"Total de referencias no válidas: {len(referencias_incorrectas)}")
+    print(f"Total de referencias ambiguas: {len(referencias_ambiguas)}")
+
+    if referencias_incorrectas or referencias_ambiguas:
+        print("\nAVISO: Hay referencias que requieren revisión.")
+    elif referencias_correctas:
+        print("\nTodas las referencias identificadas corresponden a fragmentos recuperados.")
+    else:
+        print("\nNo se han podido validar referencias.")
+
+
+def resumir_documento(
+    cliente_groq: Groq,
+    coleccion: Any
+) -> None:
+
+    nombre = seleccionar_documento(coleccion)
+
+    if nombre is None:
+        return
+
+    fragmentos = recuperar_documento_completo(
+        coleccion,
+        nombre
+    )
+
+    if not fragmentos:
+        print("No se han encontrado fragmentos del documento.")
+        return
+
+    # FASE 1: Dividir el documento en bloques.
+    bloques = agrupar_fragmentos(fragmentos)
+
+    print("\n" + "=" * 60)
+    print(f"RESUMEN DEL DOCUMENTO: {nombre}")
+    print("=" * 60)
+    print(f"Fragmentos recuperados: {len(fragmentos)}")
+    print(f"Bloques de procesamiento: {len(bloques)}")
+    print("\nGenerando resúmenes parciales...\n")
+
+    try:
+
+        resumenes = []
+
+        # FASE 2: Generar un resumen por cada bloque.
+        for numero, bloque in enumerate(bloques, start=1):
+
+            print(f"Procesando bloque {numero} de {len(bloques)}...")
+
+            contexto = construir_contexto_documento(
+                bloque,
+                max_caracteres=MAX_CARACTERES_BLOQUE
+            )
+
+            instrucciones = (
+                "Eres un asistente especializado en resumir documentos. "
+                "Resume exclusivamente la información proporcionada. "
+                "No inventes información. "
+                "Identifica las ideas principales y los conceptos importantes. "
+                "Sé conciso, pero conserva los datos relevantes. "
+                "Cada afirmación importante debe incluir su referencia "
+                "documental utilizando EXCLUSIVAMENTE este formato: "
+                "[Fuente: nombre_documento | Fragmento: numero]. "
+                "Utiliza exactamente los nombres y números presentes "
+                "en el contexto. No inventes referencias. "
+                "Limita el resumen a unas 1200 palabras como máximo."
+            )
+
+            resumen_parcial = generar_resumen_groq(
+                cliente_groq,
+                instrucciones,
+                contexto
+            )
+
+            resumenes.append(resumen_parcial)
+
+        # FASE 3: Consolidar los resúmenes parciales si es necesario.
+        while sum(len(r) for r in resumenes) > MAX_CARACTERES_RESUMENES:
+
+            print("\nConsolidando resúmenes parciales...")
+
+            grupos = []
+            grupo_actual = []
+            caracteres = 0
+
+            for resumen in resumenes:
+
+                longitud = len(resumen) + 2
+
+                if (
+                    grupo_actual
+                    and caracteres + longitud > MAX_CARACTERES_RESUMENES
+                ):
+                    grupos.append(grupo_actual)
+                    grupo_actual = []
+                    caracteres = 0
+
+                grupo_actual.append(resumen)
+                caracteres += longitud
+
+            if grupo_actual:
+                grupos.append(grupo_actual)
+
+            nuevos_resumenes = []
+
+            for grupo in grupos:
+
+                contenido_grupo = "\n\n".join(grupo)
+
+                instrucciones = (
+                    "Eres un asistente especializado en consolidar resúmenes. "
+                    "Integra la información proporcionada, elimina repeticiones "
+                    "y conserva las ideas importantes. "
+                    "OBLIGATORIO: conserva exactamente las referencias "
+                    "documentales existentes, sin modificarlas ni inventar otras. "
+                    "No elimines referencias que respalden información relevante. "
+                    "No añadas información que no aparezca en los textos."
+                )
+
+                resumen_consolidado = generar_resumen_groq(
+                    cliente_groq,
+                    instrucciones,
+                    contenido_grupo
+                )
+
+                nuevos_resumenes.append(resumen_consolidado)
+
+            resumenes = nuevos_resumenes
+
+        # FASE 4: Generar el resumen definitivo.
+        print("\nGenerando resumen definitivo...\n")
+
+        contenido_parcial = "\n\n".join(resumenes)
+
+        instrucciones_finales = (
+            "Eres un asistente especializado en elaborar resúmenes "
+            "de documentos. "
+            "Elabora un resumen final claro, estructurado y conciso "
+            "a partir de los resúmenes proporcionados. "
+            "Identifica las ideas principales, los conceptos importantes "
+            "y las conclusiones del documento. "
+            "Evita repeticiones. "
+            "No inventes información. "
+            "OBLIGATORIO: conserva exactamente las referencias documentales "
+            "existentes utilizando el formato "
+            "[Fuente: nombre_documento | Fragmento: numero]. "
+            "No inventes, modifiques ni atribuyas referencias incorrectas."
+        )
+
+        contenido = generar_resumen_groq(
+            cliente_groq,
+            instrucciones_finales,
+            contenido_parcial
+        )
+
+        print("\n" + "=" * 60)
+        print(f"RESUMEN: {nombre}")
+        print("=" * 60)
+        print(contenido)
+
+        # FASE 5: Validar las referencias contra los fragmentos originales.
+        validar_referencias(contenido, fragmentos)
+
+    except Exception as e:
+        print(f"Error al generar el resumen: {e}")
+
+
+def breve_resumen_documento(
+    cliente_groq: Groq,
+    coleccion: Any
+) -> None:
+
+    nombre = seleccionar_documento(coleccion)
+
+    if nombre is None:
+        return
+
+    fragmentos = recuperar_documento_completo(
+        coleccion,
+        nombre
+    )
+
+    contexto = construir_contexto_documento(fragmentos)
+
+    try:
+        respuesta = cliente_groq.chat.completions.create(
+            model=MODELO_IA,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Resume el documento en un máximo de tres frases. "
+                        "Identifica su tema principal y su contenido más relevante. "
+                        "Utiliza exclusivamente la información proporcionada. "
+                        "No inventes información."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": contexto
+                }
+            ],
+            temperature=0.2
+        )
+
+        print("\n" + "=" * 60)
+        print(f"BREVE RESUMEN: {nombre}")
+        print("=" * 60)
+        print(respuesta.choices[0].message.content)
+
+    except Exception as e:
+        print(f"Error al generar el resumen: {e}")
+
+def generar_resumen_groq(
+    cliente_groq: Groq,
+    instrucciones: str,
+    contenido: str
+) -> str:
+
+    respuesta = cliente_groq.chat.completions.create(
+        model=MODELO_IA,
+        messages=[
+            {"role": "system", "content": instrucciones},
+            {"role": "user", "content": contenido}
+        ],
+        temperature=0.2
+    )
+
+    if not respuesta.choices:
+        raise ValueError("Groq no ha devuelto ninguna opción.")
+
+    opcion = respuesta.choices[0]
+    mensaje = opcion.message
+    resultado = mensaje.content
+
+    if not resultado:
+        print("\nDIAGNÓSTICO DE GROQ")
+        print("-" * 40)
+        print(f"Modelo: {respuesta.model}")
+        print(f"Motivo de finalización: {opcion.finish_reason}")
+        print(f"Contenido: {resultado!r}")
+        print(f"Rechazo: {mensaje.refusal}")
+        print(f"Longitud del razonamiento: {len(mensaje.reasoning or '') if hasattr(mensaje, 'reasoning') else 'No disponible'}")
+        raise ValueError("Groq ha devuelto una respuesta vacía.")
+
+    return resultado
 
 # ============================================================
 # MENÚ PRINCIPAL
@@ -534,6 +1402,10 @@ def mostrar_menu() -> None:
     print("=" * 60)
     print("1. Indexar o actualizar documentos")
     print("2. Preguntar a los documentos (RAG)")
+    print("3. Resumir un documento")
+    print("4. Listar documentos con breve resumen")
+    print("5. Breve resumen de un documento")
+    print("6. Comparar dos documentos")
     print("0. Salir")
 
 
@@ -576,6 +1448,26 @@ def main() -> None:
                 )
             else:
                 print("Debes introducir una pregunta.")
+
+        elif opcion == "3":
+            if coleccion.count() == 0:
+                print("\nNo hay documentos indexados.")
+                continue
+
+            resumir_documento(cliente_groq, coleccion)
+        elif opcion == "4":
+            listar_documentos_con_resumen(
+                cliente_groq,
+                coleccion
+            )
+        elif opcion == "5":
+            breve_resumen_documento(cliente_groq, coleccion)
+        elif opcion == "6":
+            if coleccion.count() < 2:
+                print("\nSe necesitan al menos dos documentos indexados.")
+                continue
+
+            comparar_documentos(cliente_groq, coleccion)
 
         elif opcion == "0":
             print("\nHasta pronto.")
