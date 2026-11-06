@@ -75,7 +75,7 @@ NOMBRE_COLECCION = "documentos_rag"
 TAMANO_CHUNK = 1000
 SOLAPAMIENTO = 200
 RESULTADOS_RECUPERACION = 20
-FRAGMENTOS_CONTEXTO = 5
+FRAGMENTOS_CONTEXTO = 10
 MAX_FRAGMENTOS_POR_DOCUMENTO = 2
 DISTANCIA_MAXIMA = 0.38
 MAX_CARACTERES_CONTEXTO = 18000
@@ -453,6 +453,8 @@ def indexar_documentos(
 # ============================================================
 
 
+
+
 def recuperar_fragmentos(
     pregunta: str,
     cliente_gemini: genai.Client,
@@ -460,10 +462,97 @@ def recuperar_fragmentos(
     cantidad: int = RESULTADOS_RECUPERACION
 ) -> list[dict[str, Any]]:
 
+    import re
+
     if coleccion.count() == 0:
         return []
 
-    vector_pregunta = generar_embedding(cliente_gemini, pregunta)
+    # 1. Obtener todos los fragmentos almacenados.
+    todos = coleccion.get(
+        include=["documents", "metadatas"]
+    )
+
+    documentos = todos.get("documents", [])
+    metadatos = todos.get("metadatas", [])
+
+    # 2. Identificar términos para búsqueda textual.
+    patron = re.compile(
+        r'\b(?:[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]+|[A-ZÁÉÍÓÚÜÑ]{2,})'
+        r'(?:\s+(?:[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]+|[A-ZÁÉÍÓÚÜÑ]{2,}))*\b'
+    )
+
+    palabras_genericas = {
+        "extrae", "obten", "obtén", "busca", "identifica",
+        "nombre", "nombres", "apellidos", "años", "experiencia",
+        "cv", "documento", "documentos", "empresa", "empresas",
+        "trabajado", "trabajaron", "trabajar", "quienes",
+        "quiénes", "dime", "indica", "lista", "enumera"
+    }
+
+    terminos = []
+
+    for coincidencia in patron.finditer(pregunta):
+
+        termino = coincidencia.group().strip()
+
+        if not pregunta[:coincidencia.start()].strip(" ¿¡"):
+            continue
+
+        if termino.casefold() in palabras_genericas:
+            continue
+
+        if termino.casefold() not in [
+            t.casefold() for t in terminos
+        ]:
+            terminos.append(termino)
+
+    # 3. Búsqueda textual en toda la colección.
+    fragmentos_textuales = []
+
+    for texto, metadata in zip(documentos, metadatos):
+
+        if not texto or not metadata:
+            continue
+
+        texto_normalizado = re.sub(
+            r"\s+", " ", texto
+        ).casefold()
+
+        for termino in terminos:
+
+            termino_normalizado = re.sub(
+                r"\s+", " ", termino
+            ).casefold()
+
+            if " " in termino_normalizado:
+                coincide = termino_normalizado in texto_normalizado
+            else:
+                coincide = re.search(
+                    rf"(?<!\w){re.escape(termino_normalizado)}(?!\w)",
+                    texto_normalizado
+                ) is not None
+
+            if coincide:
+
+                fragmentos_textuales.append({
+                    "texto": texto,
+                    "documento": metadata.get(
+                        "documento_origen", "Desconocido"
+                    ),
+                    "numero_chunk": metadata.get(
+                        "numero_chunk", "?"
+                    ),
+                    "distancia": None,
+                    "tipo_busqueda": "textual"
+                })
+
+                break
+
+    # 4. Búsqueda semántica original.
+    vector_pregunta = generar_embedding(
+        cliente_gemini,
+        pregunta
+    )
 
     resultados = coleccion.query(
         query_embeddings=[vector_pregunta],
@@ -471,51 +560,126 @@ def recuperar_fragmentos(
         include=["documents", "metadatas", "distances"]
     )
 
-    documentos = resultados.get("documents", [[]])[0]
-    metadatos = resultados.get("metadatas", [[]])[0]
+    documentos_sem = resultados.get("documents", [[]])[0]
+    metadatos_sem = resultados.get("metadatas", [[]])[0]
     distancias = resultados.get("distances", [[]])[0]
 
-    fragmentos = []
+    fragmentos_semanticos = []
     contador_documentos = {}
 
     for texto, metadata, distancia in zip(
-        documentos,
-        metadatos,
+        documentos_sem,
+        metadatos_sem,
         distancias
     ):
+
         distancia = float(distancia)
-        print(
-            f"Documento: {metadata.get('documento_origen')} | "
-            f"Fragmento: {metadata.get('numero_chunk')} | "
-            f"Distancia: {distancia:.4f}"
-        )
 
         if distancia > DISTANCIA_MAXIMA:
             continue
 
-        nombre_documento = metadata.get(
-            "documento_origen",
-            "Desconocido"
+        nombre = metadata.get(
+            "documento_origen", "Desconocido"
         )
 
-        cantidad_documento = contador_documentos.get(
-            nombre_documento,
-            0
-        )
+        contador = contador_documentos.get(nombre, 0)
 
-        if cantidad_documento >= MAX_FRAGMENTOS_POR_DOCUMENTO:
+        if contador >= MAX_FRAGMENTOS_POR_DOCUMENTO:
             continue
 
-        fragmentos.append({
+        fragmentos_semanticos.append({
             "texto": texto,
-            "documento": nombre_documento,
+            "documento": nombre,
             "numero_chunk": metadata.get("numero_chunk", "?"),
-            "distancia": distancia
+            "distancia": distancia,
+            "tipo_busqueda": "semantica"
         })
 
-        contador_documentos[nombre_documento] = cantidad_documento + 1
+        contador_documentos[nombre] = contador + 1
 
-    return fragmentos
+    # 5. Identificar documentos relevantes.
+    documentos_relevantes = list(dict.fromkeys(
+        fragmento["documento"]
+        for fragmento in (
+            fragmentos_textuales + fragmentos_semanticos
+        )
+    ))
+
+    # 6. Localizar el primer fragmento de cada documento.
+    primeros_fragmentos = {}
+
+    for texto, metadata in zip(documentos, metadatos):
+
+        nombre = metadata.get("documento_origen", "Desconocido")
+        numero = metadata.get("numero_chunk", "?")
+
+        if nombre not in documentos_relevantes:
+            continue
+
+        try:
+            numero_orden = int(numero)
+        except (ValueError, TypeError):
+            numero_orden = 999999
+
+        actual = primeros_fragmentos.get(nombre)
+
+        if actual is None or numero_orden < actual[0]:
+
+            primeros_fragmentos[nombre] = (
+                numero_orden,
+                {
+                    "texto": texto,
+                    "documento": nombre,
+                    "numero_chunk": numero,
+                    "distancia": None,
+                    "tipo_busqueda": "contexto"
+                }
+            )
+
+    # 7. Combinar: primer fragmento + coincidencias relevantes.
+    fragmentos_finales = []
+    referencias = set()
+
+    for nombre in documentos_relevantes:
+
+        candidatos = []
+
+        if nombre in primeros_fragmentos:
+            candidatos.append(
+                primeros_fragmentos[nombre][1]
+            )
+
+        candidatos.extend(
+            f for f in fragmentos_textuales
+            if f["documento"] == nombre
+        )
+
+        candidatos.extend(
+            f for f in fragmentos_semanticos
+            if f["documento"] == nombre
+        )
+
+        for fragmento in candidatos:
+
+            referencia = (
+                fragmento["documento"],
+                str(fragmento["numero_chunk"])
+            )
+
+            if referencia in referencias:
+                continue
+
+            referencias.add(referencia)
+            fragmentos_finales.append(fragmento)
+
+    print("\nRESUMEN DE RECUPERACIÓN")
+    print("----------------------")
+    print(f"Coincidencias textuales: {len(fragmentos_textuales)}")
+    print(f"Coincidencias semánticas: {len(fragmentos_semanticos)}")
+    print(f"Documentos relevantes: {len(documentos_relevantes)}")
+    print(f"Fragmentos finales: {len(fragmentos_finales)}")
+
+    return fragmentos_finales
 
 
 
@@ -523,27 +687,36 @@ def construir_contexto(
     fragmentos: list[dict[str, Any]],
     max_caracteres: int = MAX_CARACTERES_CONTEXTO
 ) -> str:
+
     partes = []
     caracteres = 0
 
-    for fragmento in fragmentos[:FRAGMENTOS_CONTEXTO]:
+    for fragmento in fragmentos:
+
         cabecera = (
             f"[Fuente: {fragmento['documento']} | "
             f"Fragmento: {fragmento['numero_chunk']}]\n"
         )
+
         bloque = cabecera + fragmento["texto"] + "\n\n"
 
         espacio_restante = max_caracteres - caracteres
+
         if espacio_restante <= 0:
             break
 
         if len(bloque) > espacio_restante:
-            bloque = bloque[:espacio_restante]
+            print(
+                "Aviso: se ha alcanzado el límite "
+                "máximo del contexto."
+            )
+            break
 
         partes.append(bloque)
         caracteres += len(bloque)
 
     return "\n".join(partes)
+
 
 def construir_contexto_documento(
     fragmentos: list[dict[str, Any]],
@@ -1479,3 +1652,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+    # MARCADOR_VERSION_doc_06112026
