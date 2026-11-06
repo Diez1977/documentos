@@ -983,3 +983,4 @@ if __name__ == "__main__":
     print(respuesta)
 
     # MARCADOR_VERSION_06112026
+    # PRUEBA OBTENCIÓN DOCUMENTO
