@@ -1,7 +1,14 @@
 import buscador_ia_rag as rag
 import chromadb
 import json
+import re
+import unicodedata
 
+
+# Configuración de verificación documental
+VERIFICAR_AFIRMACIONES = True
+MAX_CARACTERES_VERIFICACION = 18000
+MAX_CARACTERES_CONTEXTO_AMPLIADO = 18000
 
 #Indicamos qué colecciones de Chroma usaremos en el agente
 COLECCIONES = {
@@ -520,39 +527,376 @@ def buscar_automaticamente(pregunta):
 
     return buscar_documentos(pregunta, tipo_documento)
 
+def localizar_documento_mencionado(pregunta, coleccion):
+    """
+    Identifica documentos mencionados expresamente
+    en una pregunta mediante sus nombres indexados.
+
+    No depende del tipo de documento ni de personas concretas.
+    """
+
+    palabras_genericas = {
+        "que", "cual", "cuales", "como", "cuando",
+        "donde", "quien", "quienes", "por", "para",
+        "con", "sin", "sobre", "entre", "desde",
+        "tiene", "tienen", "aparece", "aparecen",
+        "quiero", "saber", "dime", "explica",
+        "informacion", "documento", "documentos",
+        "archivo", "archivos", "contenido",
+        "curriculum", "curriculums", "curricula",
+        "cv", "resume", "resumen", "resumir",
+        "buscar", "busca", "encuentra", "localiza",
+        "candidatos", "experiencia", "formacion"
+    }
+
+    def obtener_tokens(texto):
+
+        texto = unicodedata.normalize(
+            "NFD",
+            texto.casefold()
+        )
+
+        texto = "".join(
+            caracter
+            for caracter in texto
+            if unicodedata.category(caracter) != "Mn"
+        )
+
+        return {
+            palabra
+            for palabra in re.findall(r"[a-z0-9]+", texto)
+            if len(palabra) > 2
+            and palabra not in palabras_genericas
+        }
+
+    pregunta_normalizada = " ".join(
+        obtener_tokens(pregunta)
+    )
+
+    # Las búsquedas generales no deben limitarse a un documento.
+    consultas_generales = (
+        "busca candidatos",
+        "buscar candidatos",
+        "candidatos con",
+        "busca documentos",
+        "buscar documentos",
+        "encuentra candidatos",
+        "encuentra documentos",
+        "que documentos",
+        "documentos que",
+        "documentos sobre",
+        "curriculums con",
+        "quienes tienen"
+    )
+
+    texto_pregunta = pregunta.casefold()
+
+    if any(
+        frase in texto_pregunta
+        for frase in consultas_generales
+    ):
+        return None, []
+
+    tokens_pregunta = obtener_tokens(pregunta)
+
+    if len(tokens_pregunta) < 2:
+        return None, []
+
+    documentos = rag.obtener_documentos_indexados(coleccion)
+
+    coincidencias = []
+
+    for documento in documentos:
+
+        tokens_documento = obtener_tokens(documento)
+
+        coincidencias_documento = (
+            tokens_pregunta & tokens_documento
+        )
+
+        if len(coincidencias_documento) >= 2:
+
+            coincidencias.append(
+                (documento, len(coincidencias_documento))
+            )
+
+    if not coincidencias:
+        return None, []
+
+    puntuacion_maxima = max(
+        puntuacion
+        for _, puntuacion in coincidencias
+    )
+
+    mejores = [
+        documento
+        for documento, puntuacion in coincidencias
+        if puntuacion == puntuacion_maxima
+    ]
+
+    if len(mejores) != 1:
+        return None, mejores
+
+    return mejores[0], []
+
+
+
+def verificar_afirmaciones(respuesta, contexto, cliente_groq):
+    """
+    Comprueba si las afirmaciones de una respuesta
+    están respaldadas por el contexto documental.
+    """
+
+    try:
+
+        if not respuesta or not contexto:
+            return {
+                "error": "La respuesta o el contexto están vacíos."
+            }
+
+        # Limitar el tamaño de la información enviada.
+        contexto = contexto[:MAX_CARACTERES_VERIFICACION]
+
+        instrucciones = """
+Eres un verificador de afirmaciones documentales.
+
+Tu trabajo consiste en comprobar si las afirmaciones
+de una respuesta están respaldadas por el contexto original.
+
+REGLAS:
+
+1. Analiza las afirmaciones factuales importantes.
+2. Contrasta cada afirmación con el contexto.
+3. No utilices conocimientos externos.
+4. No confundas conceptos relacionados con equivalentes.
+5. Una afirmación parcialmente respaldada no debe
+   clasificarse como confirmada.
+6. No inventes referencias documentales.
+7. Si no existe evidencia suficiente, indícalo.
+8. No consideres una referencia válida como prueba
+   automática de que la afirmación sea correcta.
+
+CLASIFICACIONES:
+
+- RESPALDADA
+- PARCIALMENTE RESPALDADA
+- NO RESPALDADA
+
+Devuelve exclusivamente un objeto JSON con esta estructura:
+
+{
+    "afirmaciones": [
+        {
+            "afirmacion": "Texto de la afirmación",
+            "estado": "RESPALDADA",
+            "fuentes": [
+                {
+                    "documento": "nombre_documento",
+                    "fragmento": 1
+                }
+            ],
+            "justificacion": "Explicación breve"
+        }
+    ],
+    "conclusion": "Valoración general de la respuesta"
+}
+
+Incluye todas las afirmaciones factuales relevantes.
+Si no hay afirmaciones verificables, devuelve una lista vacía.
+"""
+
+        mensaje_usuario = (
+            "RESPUESTA QUE DEBES VERIFICAR:\n\n"
+            f"{respuesta}\n\n"
+            "CONTEXTO DOCUMENTAL ORIGINAL:\n\n"
+            f"{contexto}"
+        )
+
+        resultado = cliente_groq.chat.completions.create(
+            model=rag.MODELO_IA,
+            messages=[
+                {
+                    "role": "system",
+                    "content": instrucciones
+                },
+                {
+                    "role": "user",
+                    "content": mensaje_usuario
+                }
+            ],
+            temperature=0,
+            max_tokens=1500
+        )
+
+        contenido = resultado.choices[0].message.content
+
+        if not contenido:
+            return {
+                "error": "Groq no ha devuelto la verificación."
+            }
+
+        # Limpiar posibles bloques Markdown.
+        contenido = contenido.strip()
+
+        if contenido.startswith("```"):
+            contenido = contenido.removeprefix("```json")
+            contenido = contenido.removeprefix("```")
+            contenido = contenido.removesuffix("```").strip()
+
+        # Convertir la respuesta JSON en un diccionario.
+        verificacion = json.loads(contenido)
+
+        if not isinstance(verificacion, dict):
+            return {
+                "error": "El formato de verificación no es válido."
+            }
+
+        if not isinstance(verificacion.get("afirmaciones"), list):
+            return {
+                "error": "No se ha recibido una lista de afirmaciones válida."
+            }
+
+        return verificacion
+
+    except json.JSONDecodeError:
+        return {
+            "error": "Groq no ha devuelto un JSON válido."
+        }
+
+    except Exception as e:
+        return {
+            "error": f"Error verificando afirmaciones: {e}"
+        }
+
+
+
+
 def preguntar_documentos(pregunta, tipo_documento):
 
     try:
         if tipo_documento not in COLECCIONES:
             return "Tipo de documento no válido."
 
-        # Obtener la colección
         cliente_chroma = obtener_cliente_chroma()
 
         coleccion = cliente_chroma.get_collection(
             name=COLECCIONES[tipo_documento]
         )
 
-        # Crear clientes
         cliente_gemini, cliente_groq = rag.crear_clientes()
 
-        # Recuperar fragmentos
-        fragmentos = rag.recuperar_fragmentos(
+        # 1. Intentar identificar un documento concreto.
+        nombre_documento, ambiguos = localizar_documento_mencionado(
             pregunta,
-            cliente_gemini,
             coleccion
         )
 
-        if not fragmentos:
-            return "No se ha encontrado información suficientemente relevante."
+        if ambiguos:
+            return (
+                "La pregunta coincide con varios documentos:\n"
+                + "\n".join(f"- {nombre}" for nombre in ambiguos)
+                + "\nNecesitamos concretar cuál quieres consultar."
+            )
 
-        # Construir contexto
-        contexto = rag.construir_contexto(fragmentos)
+        if nombre_documento:
 
-        # Construir mensaje
+            print(f"Documento identificado: {nombre_documento}")
+
+            # Recuperar todos los fragmentos del documento.
+            fragmentos = rag.recuperar_documento_completo(
+                coleccion,
+                nombre_documento
+            )
+
+            if not fragmentos:
+                return "No se ha podido recuperar el documento."
+
+            contexto = rag.construir_contexto_documento(fragmentos)
+
+            print(f"Fragmentos recuperados: {len(fragmentos)}")
+
+        else:
+
+            # 2. Búsqueda semántica general.
+            print("Realizando búsqueda semántica general...")
+
+            fragmentos = rag.recuperar_fragmentos(
+                pregunta,
+                cliente_gemini,
+                coleccion
+            )
+
+            if not fragmentos:
+                return (
+                    "No se ha encontrado información "
+                    "suficientemente relevante."
+                )
+
+            contexto = rag.construir_contexto(fragmentos)
+
+            print(
+                f"Fragmentos recuperados: {len(fragmentos)}"
+            )
+
+            print(
+                f"Caracteres del contexto: {len(contexto)}"
+            )
+
+        if not contexto:
+            return "No se ha podido construir el contexto documental."
+
+        # 3. Instrucciones de rigor documental.
+        instrucciones_sistema = (
+            rag.INSTRUCCIONES_SISTEMA
+            + "\n\n"
+            + """
+REGLAS OBLIGATORIAS DE RIGOR DOCUMENTAL:
+
+1. Utiliza exclusivamente la información contenida
+   en los fragmentos documentales proporcionados.
+
+2. No confundas conceptos relacionados con conceptos equivalentes.
+   La similitud semántica no demuestra que dos términos signifiquen
+   lo mismo.
+
+3. Para afirmar que una persona tiene experiencia en una tecnología,
+   titulación o competencia concreta, debe existir evidencia explícita
+   o inequívoca en el contexto.
+
+4. Una coincidencia parcial no acredita una competencia específica.
+   Ejemplos:
+   - SQL no demuestra experiencia en SQL Server.
+   - Programación no demuestra experiencia en Python.
+   - Bases de datos no demuestra experiencia en SQL Server.
+
+5. Cuando busques una competencia concreta, clasifica los resultados:
+   - EVIDENCIA CONFIRMADA.
+   - EVIDENCIA RELACIONADA.
+   - SIN EVIDENCIA.
+
+6. No presentes coincidencias relacionadas como candidatos
+   con experiencia confirmada.
+
+7. Incluye el documento de procedencia y el fragmento
+   que respalda cada afirmación.
+
+8. No inventes responsabilidades, tecnologías, titulaciones,
+   periodos ni experiencias profesionales.
+
+9. No afirmes que una competencia no aparece en un documento
+   completo cuando solo has recibido algunos fragmentos.
+
+10. Si la información es insuficiente, reconócelo expresamente.
+
+La prioridad absoluta es la precisión documental,
+no la cantidad de resultados.
+"""
+        )
+
+        # 4. Construir el mensaje para Groq.
         mensaje_usuario = (
-            "A continuación tienes los fragmentos recuperados "
-            "de los documentos.\n\n"
+            "Responde utilizando exclusivamente la información "
+            "documental proporcionada.\n\n"
             "=== INICIO DEL CONTEXTO DOCUMENTAL ===\n"
             f"{contexto}\n"
             "=== FIN DEL CONTEXTO DOCUMENTAL ===\n\n"
@@ -560,13 +904,13 @@ def preguntar_documentos(pregunta, tipo_documento):
             f"{pregunta}"
         )
 
-        # Consultar a Groq
+        # 5. Consultar a Groq.
         respuesta = cliente_groq.chat.completions.create(
             model=rag.MODELO_IA,
             messages=[
                 {
                     "role": "system",
-                    "content": rag.INSTRUCCIONES_SISTEMA
+                    "content": instrucciones_sistema
                 },
                 {
                     "role": "user",
@@ -578,8 +922,30 @@ def preguntar_documentos(pregunta, tipo_documento):
 
         contenido = respuesta.choices[0].message.content
 
-        # Validar referencias
+        if not contenido:
+            return "Groq no ha generado ninguna respuesta."
+
+        # 6. Validar referencias documentales.
         rag.validar_referencias(contenido, fragmentos)
+
+        # 7. Verificar afirmaciones.
+        if VERIFICAR_AFIRMACIONES:
+
+            verificacion = verificar_afirmaciones(
+                contenido,
+                contexto,
+                cliente_groq
+            )
+
+            print("\n" + "=" * 60)
+            print("VERIFICACIÓN DE AFIRMACIONES")
+            print("=" * 60)
+
+            print(json.dumps(
+                verificacion,
+                ensure_ascii=False,
+                indent=2
+            ))
 
         return contenido
 
@@ -615,4 +981,3 @@ if __name__ == "__main__":
     print("RESPUESTA FINAL DEL AGENTE")
     print("=" * 60)
     print(respuesta)
-    
